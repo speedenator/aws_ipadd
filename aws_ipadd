@@ -3,14 +3,14 @@
 # python3 -m pip install boto3 --break-system-packages
 # python3 -m pip install requests --break-system-packages
 
-from boto3.session import Session
-from botocore.exceptions import ProfileNotFound,ClientError
-import requests
-import os
 import argparse
 import configparser
+import logging
+import os
 import sys
-
+from boto3.session import Session
+from botocore.exceptions import ProfileNotFound, ClientError
+import requests
 
 # Defining helper functions
 
@@ -39,22 +39,30 @@ def revoke_ip_permission(session, security_group_id, ip, data):
 def create_rule(session, security_group_id, public_ip, data):
     try:
         allow_ip_permission(session, security_group_id, public_ip, data)
-        print("Successful! Your IP {} and Port {} is whitelisted.".format(public_ip, data["port"]))
+        logging.info("Successful! Your IP {} and Port {} is whitelisted.".format(public_ip, data["port"]))
     except Exception as error:
         error = str(error)
-        print(error[error.index(':') + 2:])
-
+        logging.error(error[error.index(':') + 2:])
 
 def main():
     # Configurations
 
-    parser = argparse.ArgumentParser(description='Add your current public ip into AWS security group')
+    parser = argparse.ArgumentParser(description='Add your current public IP into AWS security group')
     parser.add_argument('profile_names', metavar='Profile Names', nargs='*', help='ipadd profile name(s)')
+    parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (use -v, -vv, or -vvv)')
     args = parser.parse_args()
+
+    # Set up logging
+    log_level = logging.WARN
+    if args.verbose == 1:
+        log_level = logging.INFO
+    elif args.verbose >= 2:
+        log_level = logging.DEBUG
+    logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
 
     config_file = "{}/.aws_ipadd/aws_ipadd".format(os.environ['HOME'])
     public_ip = requests.get('https://checkip.amazonaws.com').text.strip() + '/32'
-        
+
     # Reading file for config
     config = configparser.ConfigParser()
     config.sections()
@@ -64,17 +72,17 @@ def main():
         profile_name_list = config.sections()
     else:
         profile_name_list = args.profile_names
-        
+
     # Loop over profile names
     for profile_name in profile_name_list:
 
-        print("---------------")
-        print(profile_name)
-        print("---------------")
+        logging.info("---------------")
+        logging.info(profile_name)
+        logging.info("---------------")
 
         # Check if config exists for the profile name
         if not profile_name in config:
-            print("Profile_name \"" + profile_name + "\" doesn't exist, please check \"" + config_file + "\" file.")
+            logging.error("Profile_name \"" + profile_name + "\" doesn't exist, please check \"" + config_file + "\" file.")
             continue
 
         # Initialising required variables
@@ -86,49 +94,55 @@ def main():
         aws_profile = section_config['aws_profile']
         region_name = section_config['region_name']
 
-        session = Session(profile_name=aws_profile,region_name=region_name)
-        session = session.client('ec2')
+        session = Session(profile_name=aws_profile, region_name=region_name).client("ec2")
 
         try:
             security_group = session.describe_security_groups(GroupIds=[security_group_id])
         except ClientError as error:
-            print(error)
+            logging.error(error)
+            logging.error("bailing...")
             sys.exit()
 
         try:
             security_group_rules = security_group['SecurityGroups'][0]['IpPermissions']
         except ClientError as error:
-            print(error)
+            logging.error(error)
+            logging.error("stopping...")
             sys.exit()
 
         security_group_rule = [security_group_rule for security_group_rule in security_group_rules if 'FromPort' in security_group_rule and security_group_rule['FromPort'] == port]
 
+        # Create rule if rule not defined
+        if (not security_group_rule) or len(security_group_rule) == 0:
+            create_rule(session, security_group_id, public_ip,
+                        {"port": port, "protocol": protocol, "rule_name": rule_name})
+            sys.exit()
+
         if security_group_rule:
             current_public_ip = [ip for ip in security_group_rule[0]['IpRanges'] if ip['CidrIp'] != public_ip]
             security_group_rule_name = [sg_rule_name for sg_rule_name in current_public_ip if 'Description' in sg_rule_name and sg_rule_name['Description'] == rule_name]
-
-        # Create rule if rule not defined
-        if len(security_group_rule) == 0:
-            create_rule(session, security_group_id, public_ip, {"port": port, "protocol": protocol, "rule_name": rule_name})
-            sys.exit()
+        else:
+            security_group_rule_name = []
 
         # Check rule name
         if len(security_group_rule_name) != 0:
-            print("Modifying existing rule...")
+            logging.info("Modifying existing rule...")
             exist_ip = security_group_rule_name[0]['CidrIp']
 
             try:
-                print("Removing old whitelisted IP '{}'.".format(exist_ip))
+                logging.info("Removing old whitelisted IP '{}'.".format(exist_ip))
                 revoke_ip_permission(session, security_group_id, exist_ip, {"port": port, "protocol": protocol, "rule_name": rule_name})
-                print("Whitelisting new IP '{}'.".format(public_ip))
+                logging.info("Whitelisting new IP '{}'.".format(public_ip))
                 allow_ip_permission(session, security_group_id, public_ip, {"port": port, "protocol": protocol, "rule_name": rule_name})
-                print("Rule successfully updated!")
+                logging.info("Rule successfully updated!")
             except Exception as error:
                 error = str(error)
-                print(error[error.index(':') + 2:])
-        else:
+                logging.error(error[error.index(':') + 2:])
+        elif len(security_group_rule) == 0:  # no rule so make one, otherwise we have dupes to ignore
+            logging.info(f"Creating rule for {port} {protocol} {rule_name}")
             create_rule(session, security_group_id, public_ip, {"port": port, "protocol": protocol, "rule_name": rule_name})
-
+        else:
+            logging.info(f"Rule {rule_name} already exists for IP {public_ip} and {protocol}/{port}, skipping")
 
 if __name__ == '__main__':
     main()
